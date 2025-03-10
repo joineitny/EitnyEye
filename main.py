@@ -1,94 +1,155 @@
 import pandas as pd
+import sqlite3
+import json
 import glob
 import os
-import csv
+import re
+import logging
+import ijson
+import threading
+import shutil
+import psutil
+import time
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
-folder_path = './'
-output_file = 'merged_data.csv'
+# Чтение конфигурации из внешнего файла
+with open('config.json') as config_file:
+    config = json.load(config_file)
 
-# Функция определения разделителя
-def detect_delimiter(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        sample = f.read(4096)
-        sniffer = csv.Sniffer()
-        dialect = sniffer.sniff(sample, delimiters=[',', '\t', ';', '|'])
-    return dialect.delimiter
+THREADS = config['threads']
+CHUNKSIZE = config['chunksize']
+DATA_FOLDER = config['data_folder']
+DB_PATH = config['database_path']
 
-# Функция чтения JSON файла по частям
-def json_chunk_reader(file, chunk_size=100000):
-    data = pd.read_json(file, encoding='utf-8')
-    for start in range(0, len(data), chunk_size):
-        yield data.iloc[start:start + chunk_size]
+# Настройка логирования
+logging.basicConfig(filename='data_processing.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
 
-file_handlers = {
-    '.csv': lambda file: pd.read_csv(
-        file,
-        delimiter=detect_delimiter(file),
-        chunksize=100000,
-        encoding='utf-8',
-        on_bad_lines='skip'
-    ),
-    '.json': lambda file: json_chunk_reader(file, chunk_size=100000),
-    '.txt': lambda file: pd.read_csv(
-        file,
-        delimiter=detect_delimiter(file),
-        chunksize=100000,
-        encoding='utf-8',
-        on_bad_lines='skip'
-    )
-}
+# Создание резервной копии БД
+if os.path.exists(DB_PATH):
+    shutil.copy(DB_PATH, DB_PATH + '.backup')
+    logging.info("Создана резервная копия базы данных.")
 
-# Удаляем старый результат, если он есть
-output_file = 'merged_data.csv'
-if os.path.exists(output_file):
-    os.remove(output_file)
+# Создаем подключение к новой базе SQLite
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cursor = conn.cursor()
+db_lock = threading.Lock()
 
-all_files = []
-for ext in file_handlers.keys():
-    all_files = glob.glob(os.path.join(folder_path, f'*{ext}'))
-    all_files.extend(all_files)
+# Создаем итоговую таблицу
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    age INTEGER,
+    email TEXT,
+    source_file TEXT
+)
+''')
 
-total_files = len(all_files)
-processed_files = 0
+# Мониторинг системы
+monitoring = True
+def monitor_resources():
+    while monitoring:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory().percent
+        logging.info(f"CPU: {cpu}%, RAM: {mem}%")
 
-for file in all_files:
-    ext = os.path.splitext(file)[1]
-    handler = file_handlers[ext]
+monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
+monitor_thread.start()
 
+# Функция предварительной обработки файлов (замена разделителей)
+def preprocess_file(file):
+    with open(file, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    content = re.sub(r'[,:;\t]+', '|', content)
+
+    preprocessed_file = file + '_processed'
+    with open(preprocessed_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+    return preprocessed_file
+
+# Функция обработки CSV файлов
+def process_csv(file):
+    file = preprocess_file(file)
+    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE)
+    df_list = [chunk.assign(source_file=file) for chunk in df_iter]
+    return pd.concat(df_list, ignore_index=True)
+
+# Функция обработки JSON файлов с потоковой обработкой
+def process_json(file):
+    data = []
+    with open(file, 'r', encoding='utf-8') as f:
+        parser = ijson.items(f, 'item')
+        for item in parser:
+            data.append(item)
+            if len(data) >= CHUNKSIZE:
+                break
+    df = pd.json_normalize(data)
+    df['source_file'] = file
+    return df
+
+# Функция обработки TXT файлов
+def process_txt(file):
+    file = preprocess_file(file)
+    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE)
+    df_list = [chunk.assign(source_file=file) for chunk in df_iter]
+    return pd.concat(df_list, ignore_index=True)
+
+# Функция обработки SQL файлов
+def process_sql(file):
+    temp_conn = sqlite3.connect(file)
+    df = pd.read_sql_query(f"SELECT * FROM people LIMIT {CHUNKSIZE}", temp_conn)
+    df['source_file'] = file
+    temp_conn.close()
+    return df
+
+# Функция обработки файла с логированием, защитой от дубликатов и мониторингом времени
+def process_file(file):
+    start_time = time.time()
+    filename, ext = os.path.splitext(file)
     try:
-        file_size = os.path.getsize(file)
-        bytes_read = 0
-        print(f'📄 Начинаем обработку файла: {file}')
+        if ext == '.csv':
+            df = process_csv(file)
+        elif ext == '.json':
+            df = process_json(file)
+        elif ext == '.txt':
+            df = process_txt(file)
+        elif ext == '.sql':
+            df = process_sql(file)
+        else:
+            logging.info(f"Пропущен неизвестный формат: {file}")
+            return
 
-        for chunk in handler(file):
-            if len(chunk.columns) == 1:
-                # Если данные объединились в одну колонку, разделяем на столбцы
-                delimiter = detect_delimiter(file)
-                chunk = chunk.iloc[:, 0].str.split(delimiter, expand=True)
-
-                # Автоматически устанавливаем имена столбцов
-                chunk.columns = ['bonus_card', 'full_name', 'email', 'phone', 'user_agent', 'date']
-
-            # Всегда добавляем источник файла
-            chunk['source_file'] = os.path.basename(file)
-
-            # Считаем процент прогресса более точно
-            bytes_read += chunk.memory_usage(deep=True).sum()
-            percent = min((bytes_read / file_size) * 100, 100)
-
-            # Записываем в CSV
-            header = not os.path.exists(output_file)
-            chunk.to_csv(output_file, mode='a', index=False, header=header, encoding='utf-8')
-
-            print(f'   └─ Прогресс файла "{os.path.basename(file)}": {percent:.2f}%')
-
-            del chunk  # очищаем память
-
-        processed_files += 1
-        total_percent = (processed_files / total_files) * 100
-        print(f'✅ Завершен файл: {file} ({total_files}/{processed_files} файлов обработано - {total_progress:.2f}%)\n')
+        df.drop_duplicates(inplace=True)
+        with db_lock:
+            df.to_sql('people', conn, if_exists='append', index=False)
+        elapsed_time = time.time() - start_time
+        logging.info(f"Файл {file} обработан за {elapsed_time:.2f} сек.")
 
     except Exception as e:
-        print(f'⚠️ Ошибка при обработке файла {file}: {e}')
+        logging.error(f"Ошибка обработки {file}: {e}")
 
-print('🚀 Готово. Итоговый файл сохранён как merged_data.csv')
+# Запуск мониторинга ресурсов
+monitor_thread.start()
+
+# Обрабатываем все файлы параллельно
+all_files = glob.glob(f'{DATA_FOLDER}/*')
+
+with ThreadPoolExecutor(max_workers=THREADS) as executor:
+    list(tqdm(executor.map(process_file, all_files), total=len(all_files), desc="Processing files"))
+
+# Остановка мониторинга ресурсов
+monitoring = False
+monitor_thread.join()
+
+# Завершаем работу с базой
+conn.commit()
+conn.close()
+
+# Очистка временных файлов
+for f in glob.glob(f"{DATA_FOLDER}/*_processed"):
+    os.remove(f)
+logging.info("Все временные файлы очищены.")
+logging.info("Обработка завершена успешно!")
