@@ -1,0 +1,6 @@
+{
+    "threads": 4,
+    "chunksize": 100000,
+    "data_folder": "data_folder",
+    "database_path": "unified_database.sqlite"
+}
