@@ -73,7 +73,7 @@ def preprocess_file(file):
 # Функция обработки CSV файлов
 def process_csv(file):
     file = preprocess_file(file)
-    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE)
+    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False)
     df_list = [chunk.assign(source_file=file) for chunk in df_iter]
     return pd.concat(df_list, ignore_index=True)
 
@@ -93,7 +93,7 @@ def process_json(file):
 # Функция обработки TXT файлов
 def process_txt(file):
     file = preprocess_file(file)
-    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE)
+    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False)
     df_list = [chunk.assign(source_file=file) for chunk in df_iter]
     return pd.concat(df_list, ignore_index=True)
 
