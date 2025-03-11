@@ -73,9 +73,11 @@ def preprocess_file(file):
 # Функция обработки CSV файлов
 def process_csv(file):
     file = preprocess_file(file)
-    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False)
-    df_list = [chunk.assign(source_file=file) for chunk in df_iter]
-    return pd.concat(df_list, ignore_index=True)
+    for chunk in pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False):
+        chunk['source_file'] = file
+        chunk.drop_duplicates(inplace=True)
+        with db_lock:
+            chunk.to_sql('people', conn, if_exists='append', index=False)
 
 # Функция обработки JSON файлов с потоковой обработкой
 def process_json(file):
@@ -93,9 +95,12 @@ def process_json(file):
 # Функция обработки TXT файлов
 def process_txt(file):
     file = preprocess_file(file)
-    df_iter = pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False)
-    df_list = [chunk.assign(source_file=file) for chunk in df_iter]
-    return pd.concat(df_list, ignore_index=True)
+    for chunk in pd.read_csv(file, delimiter='|', encoding='utf-8', chunksize=CHUNKSIZE, low_memory=False):
+        chunk['source_file'] = file
+        chunk.drop_duplicates(inplace=True)
+        with db_lock:
+            chunk.to_sql('people', conn, if_exists='append', index=False)
+
 
 # Функция обработки SQL файлов
 def process_sql(file):
