@@ -131,9 +131,6 @@ def process_file(file):
     except Exception as e:
         logging.error(f"Ошибка обработки {file}: {e}")
 
-# Запуск мониторинга ресурсов
-monitor_thread.start()
-
 # Обрабатываем все файлы параллельно
 all_files = glob.glob(f'{DATA_FOLDER}/*')
 
